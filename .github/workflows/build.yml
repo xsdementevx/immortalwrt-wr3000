@@ -86,11 +86,16 @@ jobs:
       - name: Update and install feeds
         working-directory: openwrt
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          # Ensure passwall feeds take priority over any built-in duplicates
-          ./scripts/feeds install -a -p passwall_packages
-          ./scripts/feeds install -a -p passwall2
+          ./scripts/feeds update -a 2>&1 | tee /tmp/feeds_update.log
+          echo ">> Feed directories after update:"
+          ls -la feeds/ | grep passwall || echo "!! No passwall feed dirs found"
+          ls feeds/passwall_packages/ 2>/dev/null | head -5 || true
+          ls feeds/passwall2/ 2>/dev/null | head -5 || true
+          ./scripts/feeds install -a 2>&1 | tee /tmp/feeds_install.log
+          echo ">> Checking luci-app-passwall2 availability:"
+          ./scripts/feeds search luci-app-passwall2 || echo "!! luci-app-passwall2 NOT found in feeds"
+          echo ">> Checking xray-core availability:"
+          ./scripts/feeds search xray-core || echo "!! xray-core NOT found in feeds"
 
       - name: Apply customizations
         working-directory: openwrt

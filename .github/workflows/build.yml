@@ -1,0 +1,199 @@
+name: Build ImmortalWrt for Cudy WR3000 v1
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH debug via tmate (run menuconfig manually)'
+        required: false
+        default: 'false'
+        type: boolean
+      release:
+        description: 'Publish to GitHub Releases'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: config/cudy-wr3000-v1.config
+  DIY_FEEDS_SH: scripts/diy-feeds.sh
+  DIY_CUSTOM_SH: scripts/diy-custom.sh
+  TZ: Europe/Kyiv
+
+jobs:
+  build:
+    name: Build Firmware
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set build metadata
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+          echo "BUILD_TAG=v$(date +%Y.%m.%d)" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler ecj fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gnutls-dev gperf haveged \
+            help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libncurses5-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool libz-dev lrzsz mkisofs msmtp nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            python3-pyelftools python3-setuptools qemu-utils re2c rsync \
+            scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl \
+            unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo apt-get clean
+
+      - name: Clone ImmortalWrt source
+        run: |
+          git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
+          echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Add passwall2 feeds
+        working-directory: openwrt
+        run: bash "$GITHUB_WORKSPACE/$DIY_FEEDS_SH"
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # Ensure passwall feeds take priority over any built-in duplicates
+          ./scripts/feeds install -a -p passwall_packages
+          ./scripts/feeds install -a -p passwall2
+
+      - name: Apply customizations
+        working-directory: openwrt
+        run: bash "$GITHUB_WORKSPACE/$DIY_CUSTOM_SH"
+
+      - name: Load .config and expand
+        working-directory: openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          make defconfig
+          echo "=== Config summary ==="
+          grep -c "=y" .config || true
+          echo "packages enabled"
+
+      - name: SSH debug (optional)
+        if: inputs.ssh == 'true'
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+      - name: Download package sources
+        working-directory: openwrt
+        run: |
+          make download -j8
+          find dl -size -1024c -delete
+
+      - name: Compile firmware
+        id: compile
+        working-directory: openwrt
+        run: |
+          echo "Compiling with $(nproc) threads..."
+          make -j$(nproc) 2>&1 | tee /tmp/build.log || {
+            echo "::warning::Parallel build failed, retrying with -j1 V=s"
+            make -j1 V=s 2>&1 | tee /tmp/build_verbose.log
+          }
+          # Check if firmware was produced
+          FIRMWARE=$(find bin/targets/mediatek/filogic/ -name "*cudy_wr3000-v1*sysupgrade*" 2>/dev/null | head -1)
+          if [ -n "$FIRMWARE" ]; then
+            echo "compile_status=success" >> $GITHUB_OUTPUT
+            SIZE=$(stat -c%s "$FIRMWARE")
+            echo "Firmware size: $((SIZE / 1024)) KB"
+          else
+            echo "::error::No firmware file produced!"
+            # Print image size error if present
+            grep -i "too large\|exceeds\|image size" /tmp/build.log /tmp/build_verbose.log 2>/dev/null || true
+            echo "compile_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Collect artifacts
+        id: collect
+        if: steps.compile.outputs.compile_status == 'success'
+        working-directory: openwrt
+        run: |
+          mkdir -p /tmp/firmware
+          TARGET="bin/targets/mediatek/filogic"
+          cp -v $TARGET/*cudy_wr3000-v1*sysupgrade* /tmp/firmware/ 2>/dev/null || true
+          cp -v $TARGET/*cudy_wr3000-v1*initramfs* /tmp/firmware/ 2>/dev/null || true
+          cp -v $TARGET/sha256sums /tmp/firmware/ 2>/dev/null || true
+          # Save package list
+          cp -v $TARGET/*.manifest /tmp/firmware/ 2>/dev/null || true
+          echo "=== Firmware files ==="
+          ls -lh /tmp/firmware/
+          echo "collect_status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        if: steps.collect.outputs.collect_status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-wr3000-${{ env.BUILD_DATE }}
+          path: /tmp/firmware/
+          retention-days: 30
+
+      - name: Create release
+        if: (inputs.release == 'true' || github.event_name == 'schedule') && steps.collect.outputs.collect_status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BUILD_TAG }}
+          name: Cudy WR3000 v1 — ${{ env.BUILD_DATE }}
+          body: |
+            ## ImmortalWrt + PassWall2 + Xray for Cudy WR3000 v1
+
+            **Build:** ${{ env.BUILD_DATE }} | **Source:** immortalwrt @ `${{ env.REPO_BRANCH }}` (`${{ env.OPENWRT_HASH }}`)
+
+            ### Included
+            - LuCI (Bootstrap)
+            - PassWall2 + Xray-core (VLESS/XHTTP/Reality built-in)
+            - nftables transparent proxy
+            - dnsmasq-full
+            - IPv6, dropbear SSH
+
+            ### Flash
+            ```
+            sysupgrade -v /tmp/firmware.bin
+            ```
+
+            ### Post-flash (optional)
+            ```sh
+            # Geodata for routing rules (if needed)
+            opkg update && opkg install v2ray-geoip v2ray-geosite
+            ```
+          files: /tmp/firmware/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.BUILD_DATE }}
+          path: /tmp/build*.log
+          retention-days: 7

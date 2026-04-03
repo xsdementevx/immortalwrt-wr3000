@@ -125,12 +125,16 @@ jobs:
       - name: Compile firmware
         id: compile
         working-directory: openwrt
+        timeout-minutes: 360
         run: |
           echo "Compiling with $(nproc) threads..."
-          make -j$(nproc) 2>&1 | tee /tmp/build.log || {
-            echo "::warning::Parallel build failed, retrying with -j1 V=s"
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "::warning::Parallel build failed (exit $BUILD_EXIT), retrying with -j1 V=s"
             make -j1 V=s 2>&1 | tee /tmp/build_verbose.log
-          }
+            BUILD_EXIT=${PIPESTATUS[0]}
+          fi
           # Check if firmware was produced
           FIRMWARE=$(find bin/targets/mediatek/filogic/ -name "*cudy_wr3000-v1*sysupgrade*" 2>/dev/null | head -1)
           if [ -n "$FIRMWARE" ]; then
@@ -138,9 +142,11 @@ jobs:
             SIZE=$(stat -c%s "$FIRMWARE")
             echo "Firmware size: $((SIZE / 1024)) KB"
           else
-            echo "::error::No firmware file produced!"
-            # Print image size error if present
-            grep -i "too large\|exceeds\|image size" /tmp/build.log /tmp/build_verbose.log 2>/dev/null || true
+            echo "::error::No firmware file produced! (exit code: $BUILD_EXIT)"
+            echo "=== Last 100 lines of build log ==="
+            tail -100 /tmp/build_verbose.log 2>/dev/null || tail -100 /tmp/build.log
+            echo "=== Searching for errors ==="
+            grep -i "error\|too large\|exceeds\|image size\|out of space" /tmp/build_verbose.log /tmp/build.log 2>/dev/null | tail -20 || true
             echo "compile_status=failed" >> $GITHUB_OUTPUT
             exit 1
           fi
@@ -184,8 +190,7 @@ jobs:
             - LuCI (Bootstrap)
             - PassWall2 + Xray-core (VLESS/XHTTP/Reality built-in)
             - nftables transparent proxy
-            - dnsmasq-full
-            - IPv6, dropbear SSH
+            - dnsmasq, dropbear SSH
 
             ### Flash
             ```

@@ -1,31 +1,19 @@
-name: Build ImmortalWrt for Cudy WR3000 v1
+name: Build Xray minimal for Cudy WR3000
 
 on:
+  workflow_dispatch:
   push:
     paths:
-      - 'config/**'
-      - 'files/**'
-      - 'scripts/**'
+      - 'scripts/build-xray-minimal.sh'
       - '.github/workflows/build.yml'
-  workflow_dispatch:
-    inputs:
-      ssh:
-        description: 'SSH debug via tmate'
-        required: false
-        default: 'false'
-        type: boolean
-
-env:
-  REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: openwrt-24.10
-  CONFIG_FILE: config/cudy-wr3000-v1.config
-  TZ: Europe/Kyiv
 
 jobs:
-  # ── Job 1: Build minimal xray binary ────────────────────────────────────────
   build-xray:
-    name: Build Xray (minimal)
+    name: Build Xray (VLESS + XHTTP only)
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,219 +26,27 @@ jobs:
       - name: Build minimal xray for aarch64
         run: bash scripts/build-xray-minimal.sh
 
-      - name: Upload xray binary
+      - name: Upload as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xray-minimal
+          name: xray-aarch64-minimal
           path: xray
-          retention-days: 7
-
-  # ── Job 2: Build firmware with embedded xray ────────────────────────────────
-  build-firmware:
-    name: Build Firmware
-    needs: build-xray
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download xray.xz from Job 1
-        uses: actions/download-artifact@v4
-        with:
-          name: xray-minimal
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set build metadata
-        run: |
-          sudo timedatectl set-timezone "$TZ"
-          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-          echo "BUILD_TAG=v$(date +%Y.%m.%d)" >> $GITHUB_ENV
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl \
-            device-tree-compiler ecj fastjar flex gawk gettext \
-            gcc-multilib g++-multilib git gnutls-dev gperf haveged \
-            help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
-            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
-            libncurses-dev libncurses5-dev libpython3-dev libreadline-dev \
-            libssl-dev libtool libz-dev lrzsz mkisofs msmtp nano \
-            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
-            python3-pyelftools python3-setuptools qemu-utils re2c rsync \
-            scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl \
-            unzip vim wget xmlto xxd zlib1g-dev zstd
-          sudo apt-get clean
-
-      - name: Clone ImmortalWrt source
-        run: |
-          git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
-          echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
-
-      - name: Update and install feeds
-        working-directory: openwrt
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: Inject custom files into rootfs
-        run: |
-          # Copy all files from files/ into openwrt/files/ (becomes rootfs)
-          cp -rv files/ openwrt/files/
-          chmod +x openwrt/files/etc/init.d/xray
-
-          # Embed UPX-compressed xray binary (self-decompressing, runs directly)
-          mkdir -p openwrt/files/usr/bin
-          cp -v xray openwrt/files/usr/bin/xray
-          chmod +x openwrt/files/usr/bin/xray
-          ls -lh openwrt/files/usr/bin/xray
-
-          # Enable xray init script on boot
-          mkdir -p openwrt/files/etc/rc.d
-          ln -sf ../init.d/xray openwrt/files/etc/rc.d/S99xray
-
-          echo ">> Rootfs files:"
-          find openwrt/files/ -type f
-
-      - name: Apply customizations
-        working-directory: openwrt
-        run: |
-          # LAN IP
-          sed -i 's|192\.168\.1\.1|192.168.10.1|g' package/base-files/files/bin/config_generate
-          # Hostname
-          sed -i 's|ImmortalWrt|WR3000|g' package/base-files/files/bin/config_generate
-          # Timezone
-          cat > package/base-files/files/etc/uci-defaults/99-timezone << 'EOF'
-          #!/bin/sh
-          uci -q batch <<EOB
-          set system.@system[0].timezone='EET-2EEST,M3.5.0/3,M10.5.0/4'
-          set system.@system[0].zonename='Europe/Kyiv'
-          commit system
-          EOB
-          EOF
-          chmod +x package/base-files/files/etc/uci-defaults/99-timezone
-
-      - name: Load .config
-        working-directory: openwrt
-        run: |
-          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-          make defconfig
-          echo "=== Packages enabled ==="
-          grep -c "=y" .config
-          echo "=== xray files in rootfs ==="
-          ls -lh files/usr/share/xray/ 2>/dev/null || echo "not found"
-
-      - name: SSH debug (optional)
-        if: inputs.ssh == 'true'
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-
-      - name: Download package sources
-        working-directory: openwrt
-        run: |
-          make download -j8
-          find dl -size -1024c -delete
-
-      - name: Compile firmware
-        id: compile
-        working-directory: openwrt
-        timeout-minutes: 360
-        run: |
-          echo "Compiling with $(nproc) threads..."
-          make -j$(nproc) 2>&1 | tee /tmp/build.log
-          RESULT=${PIPESTATUS[0]}
-          if [ $RESULT -ne 0 ]; then
-            echo "::warning::Parallel build failed, retrying -j1 V=s"
-            make -j1 V=s 2>&1 | tee /tmp/build_verbose.log
-            RESULT=${PIPESTATUS[0]}
-          fi
-
-          FIRMWARE=$(find bin/targets/mediatek/filogic/ \
-            -name "*cudy_wr3000-v1*sysupgrade*" 2>/dev/null | head -1)
-
-          if [ -n "$FIRMWARE" ]; then
-            SIZE=$(stat -c%s "$FIRMWARE")
-            echo ">> Firmware: $FIRMWARE"
-            echo ">> Size: $((SIZE / 1024)) KB ($((SIZE / 1024 / 1024)) MB)"
-            echo "compile_status=success" >> $GITHUB_OUTPUT
-          else
-            echo "::error::No firmware produced!"
-            grep -i "too big\|too large\|exceeds" \
-              /tmp/build_verbose.log /tmp/build.log 2>/dev/null | tail -5
-            tail -30 /tmp/build_verbose.log 2>/dev/null || tail -30 /tmp/build.log
-            echo "compile_status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
-      - name: Collect artifacts
-        id: collect
-        if: steps.compile.outputs.compile_status == 'success'
-        working-directory: openwrt
-        run: |
-          mkdir -p /tmp/firmware
-          T="bin/targets/mediatek/filogic"
-          cp -v $T/*cudy_wr3000-v1*sysupgrade* /tmp/firmware/ 2>/dev/null || true
-          cp -v $T/*cudy_wr3000-v1*initramfs* /tmp/firmware/ 2>/dev/null || true
-          cp -v $T/sha256sums /tmp/firmware/ 2>/dev/null || true
-          cp -v $T/*.manifest /tmp/firmware/ 2>/dev/null || true
-          ls -lh /tmp/firmware/
-          echo "collect_status=success" >> $GITHUB_OUTPUT
-
-      - name: Upload firmware
-        if: steps.collect.outputs.collect_status == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: immortalwrt-wr3000-${{ env.BUILD_DATE }}
-          path: /tmp/firmware/
           retention-days: 30
 
       - name: Create release
-        if: steps.collect.outputs.collect_status == 'success'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.BUILD_TAG }}
-          name: Cudy WR3000 v1 — ${{ env.BUILD_DATE }}
+          tag_name: xray-${{ github.run_number }}
+          name: Xray minimal (VLESS+XHTTP) — build ${{ github.run_number }}
           body: |
-            ## ImmortalWrt + Xray for Cudy WR3000 v1
+            Minimal xray-core for Cudy WR3000 v1 (aarch64).
+            Only VLESS + XHTTP + Reality + fakedns. UPX compressed.
 
-            **Build:** ${{ env.BUILD_DATE }} | **Source:** immortalwrt `${{ env.REPO_BRANCH }}` @ `${{ env.OPENWRT_HASH }}`
-
-            Minimal xray-core (VLESS/XHTTP/Reality) embedded as compressed data.
-            Decompresses to RAM on boot — no internet needed.
-
-            ### Flash
+            ### Install on router
+            ```sh
+            scp xray root@192.168.10.1:/usr/bin/xray
+            chmod +x /usr/bin/xray
             ```
-            sysupgrade -v /tmp/firmware.bin
-            ```
-
-            ### Post-flash
-            1. Edit `/etc/xray/config.json` with your server settings
-            2. Edit `/etc/xray/nftables.conf` if needed
-            3. Reboot or run `/etc/init.d/xray restart`
-          files: /tmp/firmware/*
+          files: xray
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ env.BUILD_DATE }}
-          path: /tmp/build*.log
-          retention-days: 7

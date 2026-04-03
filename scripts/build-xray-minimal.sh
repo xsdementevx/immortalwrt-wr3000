@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build minimal xray-core binary for aarch64
-# VLESS + XHTTP + Reality only
+# VLESS + XHTTP + Reality only — quic-go removed
 set -euo pipefail
 
 echo ">> Cloning Xray-core (latest)..."
@@ -10,10 +10,7 @@ cd /tmp/xray-src
 XRAY_VER=$(git describe --tags 2>/dev/null || git rev-parse --short HEAD)
 echo ">> Version: $XRAY_VER"
 
-# ── Patch: minimal all.go ─────────────────────────────────────────────────────
-# Go linker (dead code elimination) will NOT include packages that are not
-# imported anywhere in the import graph. So cutting all.go is enough —
-# we don't need to touch go.mod or individual transport files.
+# ── Patch 1: minimal all.go ───────────────────────────────────────────────────
 echo ">> Patching all.go to minimal protocol set..."
 cat > main/distro/all/all.go << 'GOEOF'
 package all
@@ -55,6 +52,121 @@ import (
 	_ "github.com/xtls/xray-core/main/commands/all"
 )
 GOEOF
+
+# ── Patch 2: stub nameserver_quic.go (removes quic-go from app/dns) ───────────
+echo ">> Stubbing nameserver_quic.go (DNS-over-QUIC not needed)..."
+cat > app/dns/nameserver_quic.go << 'GOEOF'
+package dns
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	dns_feature "github.com/xtls/xray-core/features/dns"
+)
+
+const NextProtoDQ = "doq"
+
+// QUICNameServer stub — DNS-over-QUIC removed to reduce binary size.
+// VLESS+XHTTP+Reality does not use DoQ.
+type QUICNameServer struct {
+	cacheController *CacheController
+	destination     *net.Destination
+	clientIP        net.IP
+}
+
+func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*QUICNameServer, error) {
+	return &QUICNameServer{}, errors.New("DNS-over-QUIC not supported in this build")
+}
+
+func (s *QUICNameServer) Name() string {
+	if s.destination == nil {
+		return "quic://unsupported"
+	}
+	return "quic:" + s.destination.String()
+}
+
+func (s *QUICNameServer) IsDisableCache() bool {
+	return false
+}
+
+func (s *QUICNameServer) newReqID() uint16 {
+	return 0
+}
+
+func (s *QUICNameServer) getCacheController() *CacheController {
+	return s.cacheController
+}
+
+func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
+	go func() {
+		select {
+		case noResponseErrCh <- errors.New("DNS-over-QUIC not supported"):
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
+	return nil, 0, errors.New("DNS-over-QUIC not supported in this build")
+}
+GOEOF
+
+# ── Patch 3: remove HTTP/3 (quic-go) from splithttp/dialer.go ─────────────────
+echo ">> Patching splithttp/dialer.go to remove HTTP/3 / quic-go dependency..."
+python3 << 'PYEOF'
+import re, sys
+
+path = 'transport/internet/splithttp/dialer.go'
+with open(path) as f:
+    content = f.read()
+
+# Remove quic-go import lines
+content = re.sub(r'\t"github\.com/apernet/quic-go"\n', '', content)
+content = re.sub(r'\t"github\.com/apernet/quic-go/http3"\n', '', content)
+
+# Remove the `if httpVersion == "3" { ... }` block by tracking brace depth
+lines = content.split('\n')
+result = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    stripped = line.strip()
+    # Detect start of the H3 block
+    if ('httpVersion == "3"' in stripped and
+            (stripped.startswith('if ') or stripped.startswith('} else if '))):
+        # Count opening braces on this line to set initial depth
+        depth = stripped.count('{') - stripped.count('}')
+        i += 1
+        while i < len(lines) and depth > 0:
+            depth += lines[i].count('{') - lines[i].count('}')
+            i += 1
+        continue
+    result.append(line)
+    i += 1
+
+content = '\n'.join(result)
+
+# Remove any imports that are only used inside the H3 block
+# (congestion, udphop — safe to remove; goimports would do this too)
+for pkg_fragment in ['/congestion"', '/udphop"']:
+    content = re.sub(r'\t[^\n]*' + re.escape(pkg_fragment) + r'\n', '', content)
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print("dialer.go patched OK")
+PYEOF
+
+# Fix any remaining unused imports in dialer.go with goimports
+go install golang.org/x/tools/cmd/goimports@latest 2>/dev/null || true
+GOPATH_BIN=$(go env GOPATH)/bin
+if [ -x "$GOPATH_BIN/goimports" ]; then
+    echo ">> Running goimports on dialer.go..."
+    "$GOPATH_BIN/goimports" -w transport/internet/splithttp/dialer.go
+fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo ">> Building xray for linux/arm64..."

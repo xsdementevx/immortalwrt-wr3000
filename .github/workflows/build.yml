@@ -38,11 +38,11 @@ jobs:
       - name: Build minimal xray for aarch64
         run: bash scripts/build-xray-minimal.sh
 
-      - name: Upload xray.xz
+      - name: Upload xray binary
         uses: actions/upload-artifact@v4
         with:
           name: xray-minimal
-          path: xray.xz
+          path: xray
           retention-days: 7
 
   # ── Job 2: Build firmware with embedded xray ────────────────────────────────
@@ -114,10 +114,11 @@ jobs:
           cp -rv files/ openwrt/files/
           chmod +x openwrt/files/etc/init.d/xray
 
-          # Embed compressed xray binary
-          mkdir -p openwrt/files/usr/share/xray
-          cp -v xray.xz openwrt/files/usr/share/xray/xray.xz
-          ls -lh openwrt/files/usr/share/xray/xray.xz
+          # Embed UPX-compressed xray binary (self-decompressing, runs directly)
+          mkdir -p openwrt/files/usr/bin
+          cp -v xray openwrt/files/usr/bin/xray
+          chmod +x openwrt/files/usr/bin/xray
+          ls -lh openwrt/files/usr/bin/xray
 
           # Enable xray init script on boot
           mkdir -p openwrt/files/etc/rc.d

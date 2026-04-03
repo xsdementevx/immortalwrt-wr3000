@@ -1,0 +1,57 @@
+#!/bin/sh /etc/rc.common
+# Xray init script — decompresses from squashfs to RAM and starts
+START=99
+STOP=10
+
+XRAY_XZ="/usr/share/xray/xray.xz"
+XRAY_BIN="/tmp/xray"
+XRAY_CONF="/etc/xray/config.json"
+XRAY_LOG="/tmp/xray.log"
+XRAY_PID="/tmp/xray.pid"
+
+start() {
+    if [ ! -f "$XRAY_XZ" ]; then
+        logger -t xray "ERROR: $XRAY_XZ not found"
+        return 1
+    fi
+
+    echo "Decompressing xray to RAM..."
+    xz -d -k -c "$XRAY_XZ" > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+
+    if [ ! -f "$XRAY_CONF" ]; then
+        logger -t xray "ERROR: $XRAY_CONF not found"
+        return 1
+    fi
+
+    echo "Starting xray..."
+    GOMEMLIMIT=60MiB GOGC=30 "$XRAY_BIN" run -config "$XRAY_CONF" \
+        >>"$XRAY_LOG" 2>&1 &
+    echo $! > "$XRAY_PID"
+
+    # Wait for xray to start, then apply nftables
+    sleep 3
+    if [ -f /etc/xray/nftables.conf ]; then
+        nft -f /etc/xray/nftables.conf
+        logger -t xray "nftables rules applied"
+    fi
+
+    logger -t xray "Started (PID $(cat $XRAY_PID))"
+}
+
+stop() {
+    if [ -f "$XRAY_PID" ]; then
+        kill "$(cat $XRAY_PID)" 2>/dev/null
+        rm -f "$XRAY_PID"
+    fi
+    killall xray 2>/dev/null
+    nft delete table ip xray 2>/dev/null
+    rm -f "$XRAY_BIN"
+    logger -t xray "Stopped"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}

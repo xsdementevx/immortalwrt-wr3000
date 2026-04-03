@@ -4,40 +4,63 @@ on:
   push:
     paths:
       - 'config/**'
-      - 'patches/**'
+      - 'files/**'
       - 'scripts/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH debug via tmate (run menuconfig manually)'
+        description: 'SSH debug via tmate'
         required: false
         default: 'false'
-        type: boolean
-      release:
-        description: 'Publish to GitHub Releases'
-        required: false
-        default: 'true'
         type: boolean
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: config/cudy-wr3000-v1.config
-  DIY_FEEDS_SH: scripts/diy-feeds.sh
-  DIY_CUSTOM_SH: scripts/diy-custom.sh
   TZ: Europe/Kyiv
 
 jobs:
-  build:
+  # ── Job 1: Build minimal xray binary ────────────────────────────────────────
+  build-xray:
+    name: Build Xray (minimal)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build minimal xray for aarch64
+        run: bash scripts/build-xray-minimal.sh
+
+      - name: Upload xray.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-minimal
+          path: xray.xz
+          retention-days: 7
+
+  # ── Job 2: Build firmware with embedded xray ────────────────────────────────
+  build-firmware:
     name: Build Firmware
+    needs: build-xray
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-      - name: Checkout this repo
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download xray.xz from Job 1
+        uses: actions/download-artifact@v4
+        with:
+          name: xray-minimal
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -79,36 +102,57 @@ jobs:
           git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
           echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Add passwall2 feeds
-        working-directory: openwrt
-        run: bash "$GITHUB_WORKSPACE/$DIY_FEEDS_SH"
-
       - name: Update and install feeds
         working-directory: openwrt
         run: |
-          ./scripts/feeds update -a 2>&1 | tee /tmp/feeds_update.log
-          echo ">> Feed directories after update:"
-          ls -la feeds/ | grep passwall || echo "!! No passwall feed dirs found"
-          ls feeds/passwall_packages/ 2>/dev/null | head -5 || true
-          ls feeds/passwall2/ 2>/dev/null | head -5 || true
-          ./scripts/feeds install -a 2>&1 | tee /tmp/feeds_install.log
-          echo ">> Checking luci-app-passwall2 availability:"
-          ./scripts/feeds search luci-app-passwall2 || echo "!! luci-app-passwall2 NOT found in feeds"
-          echo ">> Checking xray-core availability:"
-          ./scripts/feeds search xray-core || echo "!! xray-core NOT found in feeds"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Inject custom files into rootfs
+        run: |
+          # Copy all files from files/ into openwrt/files/ (becomes rootfs)
+          cp -rv files/ openwrt/files/
+          chmod +x openwrt/files/etc/init.d/xray
+
+          # Embed compressed xray binary
+          mkdir -p openwrt/files/usr/share/xray
+          cp -v xray.xz openwrt/files/usr/share/xray/xray.xz
+          ls -lh openwrt/files/usr/share/xray/xray.xz
+
+          # Enable xray init script on boot
+          mkdir -p openwrt/files/etc/rc.d
+          ln -sf ../init.d/xray openwrt/files/etc/rc.d/S99xray
+
+          echo ">> Rootfs files:"
+          find openwrt/files/ -type f
 
       - name: Apply customizations
         working-directory: openwrt
-        run: bash "$GITHUB_WORKSPACE/$DIY_CUSTOM_SH"
+        run: |
+          # LAN IP
+          sed -i 's|192\.168\.1\.1|192.168.10.1|g' package/base-files/files/bin/config_generate
+          # Hostname
+          sed -i 's|ImmortalWrt|WR3000|g' package/base-files/files/bin/config_generate
+          # Timezone
+          cat > package/base-files/files/etc/uci-defaults/99-timezone << 'EOF'
+          #!/bin/sh
+          uci -q batch <<EOB
+          set system.@system[0].timezone='EET-2EEST,M3.5.0/3,M10.5.0/4'
+          set system.@system[0].zonename='Europe/Kyiv'
+          commit system
+          EOB
+          EOF
+          chmod +x package/base-files/files/etc/uci-defaults/99-timezone
 
-      - name: Load .config and expand
+      - name: Load .config
         working-directory: openwrt
         run: |
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
           make defconfig
-          echo "=== Config summary ==="
-          grep -c "=y" .config || true
-          echo "packages enabled"
+          echo "=== Packages enabled ==="
+          grep -c "=y" .config
+          echo "=== xray files in rootfs ==="
+          ls -lh files/usr/share/xray/ 2>/dev/null || echo "not found"
 
       - name: SSH debug (optional)
         if: inputs.ssh == 'true'
@@ -129,24 +173,26 @@ jobs:
         run: |
           echo "Compiling with $(nproc) threads..."
           make -j$(nproc) 2>&1 | tee /tmp/build.log
-          BUILD_EXIT=${PIPESTATUS[0]}
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo "::warning::Parallel build failed (exit $BUILD_EXIT), retrying with -j1 V=s"
+          RESULT=${PIPESTATUS[0]}
+          if [ $RESULT -ne 0 ]; then
+            echo "::warning::Parallel build failed, retrying -j1 V=s"
             make -j1 V=s 2>&1 | tee /tmp/build_verbose.log
-            BUILD_EXIT=${PIPESTATUS[0]}
+            RESULT=${PIPESTATUS[0]}
           fi
-          # Check if firmware was produced
-          FIRMWARE=$(find bin/targets/mediatek/filogic/ -name "*cudy_wr3000-v1*sysupgrade*" 2>/dev/null | head -1)
+
+          FIRMWARE=$(find bin/targets/mediatek/filogic/ \
+            -name "*cudy_wr3000-v1*sysupgrade*" 2>/dev/null | head -1)
+
           if [ -n "$FIRMWARE" ]; then
-            echo "compile_status=success" >> $GITHUB_OUTPUT
             SIZE=$(stat -c%s "$FIRMWARE")
-            echo "Firmware size: $((SIZE / 1024)) KB"
+            echo ">> Firmware: $FIRMWARE"
+            echo ">> Size: $((SIZE / 1024)) KB ($((SIZE / 1024 / 1024)) MB)"
+            echo "compile_status=success" >> $GITHUB_OUTPUT
           else
-            echo "::error::No firmware file produced! (exit code: $BUILD_EXIT)"
-            echo "=== Last 100 lines of build log ==="
-            tail -100 /tmp/build_verbose.log 2>/dev/null || tail -100 /tmp/build.log
-            echo "=== Searching for errors ==="
-            grep -i "error\|too large\|exceeds\|image size\|out of space" /tmp/build_verbose.log /tmp/build.log 2>/dev/null | tail -20 || true
+            echo "::error::No firmware produced!"
+            grep -i "too big\|too large\|exceeds" \
+              /tmp/build_verbose.log /tmp/build.log 2>/dev/null | tail -5
+            tail -30 /tmp/build_verbose.log 2>/dev/null || tail -30 /tmp/build.log
             echo "compile_status=failed" >> $GITHUB_OUTPUT
             exit 1
           fi
@@ -157,17 +203,15 @@ jobs:
         working-directory: openwrt
         run: |
           mkdir -p /tmp/firmware
-          TARGET="bin/targets/mediatek/filogic"
-          cp -v $TARGET/*cudy_wr3000-v1*sysupgrade* /tmp/firmware/ 2>/dev/null || true
-          cp -v $TARGET/*cudy_wr3000-v1*initramfs* /tmp/firmware/ 2>/dev/null || true
-          cp -v $TARGET/sha256sums /tmp/firmware/ 2>/dev/null || true
-          # Save package list
-          cp -v $TARGET/*.manifest /tmp/firmware/ 2>/dev/null || true
-          echo "=== Firmware files ==="
+          T="bin/targets/mediatek/filogic"
+          cp -v $T/*cudy_wr3000-v1*sysupgrade* /tmp/firmware/ 2>/dev/null || true
+          cp -v $T/*cudy_wr3000-v1*initramfs* /tmp/firmware/ 2>/dev/null || true
+          cp -v $T/sha256sums /tmp/firmware/ 2>/dev/null || true
+          cp -v $T/*.manifest /tmp/firmware/ 2>/dev/null || true
           ls -lh /tmp/firmware/
           echo "collect_status=success" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact
+      - name: Upload firmware
         if: steps.collect.outputs.collect_status == 'success'
         uses: actions/upload-artifact@v4
         with:
@@ -176,32 +220,28 @@ jobs:
           retention-days: 30
 
       - name: Create release
-        if: (inputs.release == 'true' || github.event_name == 'schedule') && steps.collect.outputs.collect_status == 'success'
+        if: steps.collect.outputs.collect_status == 'success'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.BUILD_TAG }}
           name: Cudy WR3000 v1 — ${{ env.BUILD_DATE }}
           body: |
-            ## ImmortalWrt + PassWall2 + Xray for Cudy WR3000 v1
+            ## ImmortalWrt + Xray for Cudy WR3000 v1
 
-            **Build:** ${{ env.BUILD_DATE }} | **Source:** immortalwrt @ `${{ env.REPO_BRANCH }}` (`${{ env.OPENWRT_HASH }}`)
+            **Build:** ${{ env.BUILD_DATE }} | **Source:** immortalwrt `${{ env.REPO_BRANCH }}` @ `${{ env.OPENWRT_HASH }}`
 
-            ### Included
-            - LuCI (Bootstrap)
-            - PassWall2 + Xray-core (VLESS/XHTTP/Reality built-in)
-            - nftables transparent proxy
-            - dnsmasq, dropbear SSH
+            Minimal xray-core (VLESS/XHTTP/Reality) embedded as compressed data.
+            Decompresses to RAM on boot — no internet needed.
 
             ### Flash
             ```
             sysupgrade -v /tmp/firmware.bin
             ```
 
-            ### Post-flash (optional)
-            ```sh
-            # Geodata for routing rules (if needed)
-            opkg update && opkg install v2ray-geoip v2ray-geosite
-            ```
+            ### Post-flash
+            1. Edit `/etc/xray/config.json` with your server settings
+            2. Edit `/etc/xray/nftables.conf` if needed
+            3. Reboot or run `/etc/init.d/xray restart`
           files: /tmp/firmware/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

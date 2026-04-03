@@ -154,6 +154,10 @@ content = '\n'.join(result)
 for pkg_fragment in ['/congestion"', '/udphop"']:
     content = re.sub(r'\t[^\n]*' + re.escape(pkg_fragment) + r'\n', '', content)
 
+# Remove variables that were only used inside the H3 block
+# keepAlivePeriod is declared for the H3 branch and becomes unused after removal
+content = re.sub(r'[^\n]*keepAlivePeriod[^\n]*:=[^\n]*\n', '', content)
+
 with open(path, 'w') as f:
     f.write(content)
 

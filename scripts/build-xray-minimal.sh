@@ -290,6 +290,14 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 }
 GOEOF
 
+# ── Check what still imports quic-go ─────────────────────────────────────────
+echo ">> Checking remaining quic-go dependencies..."
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+    go list -deps ./main 2>/dev/null | grep -i quic || echo ">> No quic packages found!"
+
+echo ">> Packages importing quic-go directly:"
+grep -r '"github.com/apernet/quic-go' --include="*.go" -l 2>/dev/null || echo ">> None!"
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo ">> Building xray for linux/arm64..."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \

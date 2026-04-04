@@ -175,6 +175,121 @@ if [ -x "$GOPATH_BIN/goimports" ]; then
     "$GOPATH_BIN/goimports" -w transport/internet/splithttp/dialer.go
 fi
 
+# ── Patch 4: stub splithttp/hub.go (removes quic-go H3 server) ───────────────
+# Router is outbound-only; hub.go (server listener) can return error safely.
+# We still register the transport listener so the binary links correctly.
+echo ">> Stubbing splithttp/hub.go (XHTTP server/H3 not needed on router)..."
+cat > transport/internet/splithttp/hub.go << 'GOEOF'
+package splithttp
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"sync"
+
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+	itls "github.com/xtls/xray-core/transport/internet/tls"
+)
+
+// Listener is the splithttp transport listener (stub: H3/QUIC removed).
+type Listener struct {
+	sync.Mutex
+	server   http.Server
+	listener net.Listener
+	config   *Config
+	addConn  internet.ConnHandler
+}
+
+func (ln *Listener) Addr() net.Addr {
+	if ln.listener != nil {
+		return ln.listener.Addr()
+	}
+	return nil
+}
+
+func (ln *Listener) Close() error {
+	ln.Lock()
+	defer ln.Unlock()
+	if ln.listener != nil {
+		return ln.listener.Close()
+	}
+	return nil
+}
+
+// ListenXH registers the transport; HTTP/3 (quic-go) is not available in this build.
+func ListenXH(ctx context.Context, address xnet.Address, port xnet.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
+	tlsCfg := itls.ConfigFromStreamSettings(streamSettings)
+	var tlsConfig *tls.Config
+	if tlsCfg != nil {
+		tlsConfig = tlsCfg.GetTLSConfig()
+	}
+
+	listener, err := net.Listen("tcp", address.String()+":"+port.String())
+	if err != nil {
+		return nil, errors.New("splithttp: failed to listen").Base(err)
+	}
+
+	ln := &Listener{
+		listener: listener,
+		addConn:  addConn,
+	}
+
+	config, ok := streamSettings.ProtocolSettings.(*Config)
+	if !ok {
+		return nil, errors.New("splithttp: invalid config type")
+	}
+	ln.config = config
+
+	mux := http.NewServeMux()
+	ln.server = http.Server{Handler: mux, TLSConfig: tlsConfig}
+
+	go func() {
+		if err := ln.server.Serve(listener); err != nil {
+			errors.LogWarning(ctx, "splithttp server stopped: ", err)
+		}
+	}()
+
+	return ln, nil
+}
+
+func init() {
+	common.Must(internet.RegisterTransportListener(protocolName, ListenXH))
+}
+GOEOF
+
+# ── Patch 5: stub common/protocol/quic/sniff.go (removes quicvarint dep) ──────
+echo ">> Stubbing common/protocol/quic/sniff.go..."
+cat > common/protocol/quic/sniff.go << 'GOEOF'
+package quic
+
+import (
+	"github.com/xtls/xray-core/common"
+)
+
+// SniffHeader holds sniffed QUIC protocol info.
+type SniffHeader struct {
+	domain string
+}
+
+func (s *SniffHeader) Protocol() string {
+	return "quic"
+}
+
+func (s *SniffHeader) Domain() string {
+	return s.domain
+}
+
+// SniffQUIC returns ErrNoClue — quic-go/quicvarint removed from this build.
+func SniffQUIC(b []byte) (*SniffHeader, error) {
+	return nil, common.ErrNoClue
+}
+GOEOF
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo ">> Building xray for linux/arm64..."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \

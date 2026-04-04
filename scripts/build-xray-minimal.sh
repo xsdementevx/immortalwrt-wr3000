@@ -290,6 +290,92 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 }
 GOEOF
 
+# ── Patch 6: stub entire transport/internet/hysteria/ (quic-go heavy) ─────────
+echo ">> Stubbing hysteria transport (not needed for VLESS+XHTTP+Reality)..."
+
+cat > transport/internet/hysteria/conn.go << 'GOEOF'
+package hysteria
+
+import (
+	"io"
+	"time"
+
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+)
+
+// InterUdpConn stub — hysteria UDP over QUIC not used in this build.
+type InterUdpConn struct{}
+
+func (i *InterUdpConn) User() *protocol.MemoryUser     { return nil }
+func (i *InterUdpConn) SetLast()                        {}
+func (i *InterUdpConn) GetLast() time.Time              { return time.Time{} }
+func (i *InterUdpConn) Read(p []byte) (int, error)      { return 0, io.EOF }
+func (i *InterUdpConn) Write(p []byte) (int, error)     { return 0, io.ErrClosedPipe }
+func (i *InterUdpConn) Close() error                    { return nil }
+func (i *InterUdpConn) LocalAddr() net.Addr             { return nil }
+func (i *InterUdpConn) RemoteAddr() net.Addr            { return nil }
+func (i *InterUdpConn) SetDeadline(t time.Time) error   { return nil }
+func (i *InterUdpConn) SetReadDeadline(t time.Time) error  { return nil }
+func (i *InterUdpConn) SetWriteDeadline(t time.Time) error { return nil }
+GOEOF
+
+cat > transport/internet/hysteria/dialer.go << 'GOEOF'
+package hysteria
+
+import (
+	"context"
+
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
+)
+
+func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	return nil, errors.New("hysteria transport not supported in this build")
+}
+
+func init() {
+	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+}
+GOEOF
+
+cat > transport/internet/hysteria/hub.go << 'GOEOF'
+package hysteria
+
+import (
+	"context"
+
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+)
+
+type Listener struct{}
+
+func (ln *Listener) Addr() net.Addr { return nil }
+func (ln *Listener) Close() error   { return nil }
+
+func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
+	return nil, errors.New("hysteria transport not supported in this build")
+}
+
+func init() {
+	common.Must(internet.RegisterTransportListener(protocolName, Listen))
+}
+GOEOF
+
+cat > transport/internet/hysteria/congestion/utils.go << 'GOEOF'
+package congestion
+
+// UseBBR and UseBrutal stubs — hysteria congestion control removed (no quic-go).
+func UseBBR(conn interface{})              {}
+func UseBrutal(conn interface{}, tx uint64) {}
+GOEOF
+
 # ── Check what still imports quic-go ─────────────────────────────────────────
 echo ">> Checking remaining quic-go dependencies..."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \

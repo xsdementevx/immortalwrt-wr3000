@@ -117,54 +117,43 @@ GOEOF
 # ── Patch 3: remove HTTP/3 (quic-go) from splithttp/dialer.go ─────────────────
 echo ">> Patching splithttp/dialer.go to remove HTTP/3 / quic-go dependency..."
 python3 << 'PYEOF'
+import re
+
 path = 'transport/internet/splithttp/dialer.go'
 with open(path) as f:
-    lines = f.readlines()
+    content = f.read()
 
 # Step 1: remove quic-go imports
-out = []
-for line in lines:
-    if '"github.com/apernet/quic-go"' in line or '"github.com/apernet/quic-go/http3"' in line:
-        continue
-    out.append(line)
-lines = out
+content = re.sub(r'\t"github\.com/apernet/quic-go"\n', '', content)
+content = re.sub(r'\t"github\.com/apernet/quic-go/http3"\n', '', content)
+content = re.sub(r'\t[^\n]*/congestion"\n', '', content)
+content = re.sub(r'\t[^\n]*/udphop"\n', '', content)
 
-# Step 2: replace body of `if httpVersion == "3" { ... }` with `httpVersion = "2"`
-# Strategy: find the opening line, skip its body, emit a stub instead.
-# The closing `}` of the H3 block (which may be `} else if ...`) must be preserved.
-result = []
-i = 0
-while i < len(lines):
-    stripped = lines[i].strip()
-    # Match both `if httpVersion == "3" {` and `} else if httpVersion == "3" {`
-    if 'httpVersion == "3"' in stripped and stripped.endswith('{'):
-        indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
-        # Emit the opening if-line as-is (keeps else-if chain intact)
-        result.append(lines[i])
-        # Emit stub body
-        result.append(indent + '\thttpVersion = "2" // HTTP/3 removed: no quic-go\n')
-        i += 1
-        # Skip original body lines until matching closing brace
-        depth = 1
-        while i < len(lines) and depth > 0:
-            depth += lines[i].count('{') - lines[i].count('}')
-            if depth == 0:
-                # This is the closing line — emit it (could be `}` or `} else if ...`)
-                result.append(lines[i])
-            i += 1
-        continue
-    result.append(lines[i])
-    i += 1
-
-# Step 3: remove congestion/udphop imports (only used in H3 body we just stubbed)
-out = []
-for line in result:
-    if '/congestion"' in line or '/udphop"' in line:
-        continue
-    out.append(line)
+# Step 2: replace BODY of `if httpVersion == "3" { ... }` using char-level brace tracking.
+# This correctly handles `} else if ...` — stops at the matching `}`, not at net-zero lines.
+marker = 'if httpVersion == "3" {'
+idx = content.find(marker)
+if idx == -1:
+    print("WARNING: H3 marker not found")
+else:
+    # brace_start = position of the `{` that opens the H3 body
+    brace_start = idx + len(marker) - 1  # last char of marker is `{`
+    depth = 1
+    pos = brace_start + 1
+    while pos < len(content) and depth > 0:
+        if content[pos] == '{':
+            depth += 1
+        elif content[pos] == '}':
+            depth -= 1
+        pos += 1
+    # content[pos-1] is the matching `}` (closing H3 block)
+    # Replace everything between { and } (exclusive) with a stub comment
+    content = (content[:brace_start + 1] +
+               '\n\t\t// HTTP/3 (quic-go) removed from this build\n\t' +
+               content[pos - 1:])
 
 with open(path, 'w') as f:
-    f.writelines(out)
+    f.write(content)
 
 print("dialer.go patched OK")
 PYEOF

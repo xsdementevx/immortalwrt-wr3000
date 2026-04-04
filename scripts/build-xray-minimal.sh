@@ -372,9 +372,119 @@ cat > transport/internet/hysteria/congestion/utils.go << 'GOEOF'
 package congestion
 
 // UseBBR and UseBrutal stubs — hysteria congestion control removed (no quic-go).
-func UseBBR(conn interface{})              {}
+func UseBBR(conn interface{})               {}
 func UseBrutal(conn interface{}, tx uint64) {}
 GOEOF
+
+# Stub entire congestion sub-packages (brutal, bbr, common)
+cat > transport/internet/hysteria/congestion/brutal/brutal.go << 'GOEOF'
+package brutal
+GOEOF
+
+cat > transport/internet/hysteria/congestion/common/pacer.go << 'GOEOF'
+package common
+GOEOF
+
+# Replace all bbr files with empty stubs
+for f in transport/internet/hysteria/congestion/bbr/*.go; do
+    pkg=$(head -1 "$f" | awk '{print $2}')
+    echo "package $pkg" > "$f"
+done
+
+# ── Patch 7: stub proxy/hysteria (client + protocol use quicvarint) ────────────
+echo ">> Stubbing proxy/hysteria/protocol.go and client.go..."
+
+cat > proxy/hysteria/protocol.go << 'GOEOF'
+package hysteria
+
+import "io"
+
+const MaxAddressLength = 2048
+const MaxMessageLength = 2048
+const MaxPaddingLength = 4096
+const MaxUDPSize = 4096
+
+type UDPMessage struct {
+	SessionID uint32
+	PacketID  uint16
+	FragID    uint8
+	FragCount uint8
+	Addr      string
+	Data      []byte
+}
+
+func (m *UDPMessage) HeaderSize() int { return 0 }
+func (m *UDPMessage) Size() int       { return len(m.Data) }
+func (m *UDPMessage) Serialize(buf []byte) int { return 0 }
+
+func ReadTCPRequest(r io.Reader) (string, error)             { return "", io.EOF }
+func WriteTCPRequest(w io.Writer, addr string) error         { return io.ErrClosedPipe }
+func ReadTCPResponse(r io.Reader) (bool, string, error)      { return false, "", io.EOF }
+func WriteTCPResponse(w io.Writer, ok bool, msg string) error { return io.ErrClosedPipe }
+func ParseUDPMessage(msg []byte) (*UDPMessage, error)        { return nil, io.ErrUnexpectedEOF }
+GOEOF
+
+cat > proxy/hysteria/client.go << 'GOEOF'
+package hysteria
+
+import (
+	"context"
+	"io"
+
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
+)
+
+type Client struct{}
+
+type UDPWriter struct{ Writer io.Writer }
+type UDPReader struct{ Reader io.Reader }
+
+func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
+	return &Client{}, nil
+}
+
+func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	return errors.New("hysteria not supported in this build")
+}
+
+func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	return io.ErrClosedPipe
+}
+
+func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	return nil, io.EOF
+}
+
+func init() {
+	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return NewClient(ctx, config.(*ClientConfig))
+	}))
+}
+GOEOF
+
+# Stub server.go and frag.go if they import quic-go
+python3 << 'PYEOF'
+import os, re
+for fname in ['proxy/hysteria/server.go', 'proxy/hysteria/frag.go']:
+    if not os.path.exists(fname):
+        continue
+    with open(fname) as f:
+        content = f.read()
+    if 'apernet/quic-go' in content:
+        # Find package name and write empty stub
+        m = re.search(r'^package (\w+)', content, re.MULTILINE)
+        pkg = m.group(1) if m else 'hysteria'
+        with open(fname, 'w') as f:
+            f.write(f'package {pkg}\n')
+        print(f"Stubbed {fname}")
+    else:
+        print(f"No quic-go in {fname}, skipping")
+PYEOF
 
 # ── Check what still imports quic-go ─────────────────────────────────────────
 echo ">> Checking remaining quic-go dependencies..."

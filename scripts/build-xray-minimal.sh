@@ -117,49 +117,54 @@ GOEOF
 # ── Patch 3: remove HTTP/3 (quic-go) from splithttp/dialer.go ─────────────────
 echo ">> Patching splithttp/dialer.go to remove HTTP/3 / quic-go dependency..."
 python3 << 'PYEOF'
-import re, sys
-
 path = 'transport/internet/splithttp/dialer.go'
 with open(path) as f:
-    content = f.read()
+    lines = f.readlines()
 
-# Remove quic-go import lines
-content = re.sub(r'\t"github\.com/apernet/quic-go"\n', '', content)
-content = re.sub(r'\t"github\.com/apernet/quic-go/http3"\n', '', content)
+# Step 1: remove quic-go imports
+out = []
+for line in lines:
+    if '"github.com/apernet/quic-go"' in line or '"github.com/apernet/quic-go/http3"' in line:
+        continue
+    out.append(line)
+lines = out
 
-# Remove the `if httpVersion == "3" { ... }` block by tracking brace depth
-lines = content.split('\n')
+# Step 2: replace body of `if httpVersion == "3" { ... }` with `httpVersion = "2"`
+# Strategy: find the opening line, skip its body, emit a stub instead.
+# The closing `}` of the H3 block (which may be `} else if ...`) must be preserved.
 result = []
 i = 0
 while i < len(lines):
-    line = lines[i]
-    stripped = line.strip()
-    # Detect start of the H3 block
-    if ('httpVersion == "3"' in stripped and
-            (stripped.startswith('if ') or stripped.startswith('} else if '))):
-        # Count opening braces on this line to set initial depth
-        depth = stripped.count('{') - stripped.count('}')
+    stripped = lines[i].strip()
+    # Match both `if httpVersion == "3" {` and `} else if httpVersion == "3" {`
+    if 'httpVersion == "3"' in stripped and stripped.endswith('{'):
+        indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+        # Emit the opening if-line as-is (keeps else-if chain intact)
+        result.append(lines[i])
+        # Emit stub body
+        result.append(indent + '\thttpVersion = "2" // HTTP/3 removed: no quic-go\n')
         i += 1
+        # Skip original body lines until matching closing brace
+        depth = 1
         while i < len(lines) and depth > 0:
             depth += lines[i].count('{') - lines[i].count('}')
+            if depth == 0:
+                # This is the closing line — emit it (could be `}` or `} else if ...`)
+                result.append(lines[i])
             i += 1
         continue
-    result.append(line)
+    result.append(lines[i])
     i += 1
 
-content = '\n'.join(result)
-
-# Remove any imports that are only used inside the H3 block
-# (congestion, udphop — safe to remove; goimports would do this too)
-for pkg_fragment in ['/congestion"', '/udphop"']:
-    content = re.sub(r'\t[^\n]*' + re.escape(pkg_fragment) + r'\n', '', content)
-
-# Remove variables that were only used inside the H3 block
-# keepAlivePeriod is declared for the H3 branch and becomes unused after removal
-content = re.sub(r'[^\n]*keepAlivePeriod[^\n]*:=[^\n]*\n', '', content)
+# Step 3: remove congestion/udphop imports (only used in H3 body we just stubbed)
+out = []
+for line in result:
+    if '/congestion"' in line or '/udphop"' in line:
+        continue
+    out.append(line)
 
 with open(path, 'w') as f:
-    f.write(content)
+    f.writelines(out)
 
 print("dialer.go patched OK")
 PYEOF

@@ -129,28 +129,37 @@ content = re.sub(r'\t"github\.com/apernet/quic-go/http3"\n', '', content)
 content = re.sub(r'\t[^\n]*/congestion"\n', '', content)
 content = re.sub(r'\t[^\n]*/udphop"\n', '', content)
 
-# Step 2: replace BODY of `if httpVersion == "3" { ... }` using char-level brace tracking.
-# This correctly handles `} else if ...` — stops at the matching `}`, not at net-zero lines.
+# Step 2: find the H3 block that actually contains quic — anchored after "var transport"
+# There are TWO `if httpVersion == "3"` blocks; the first is tiny (sets dest.Network).
+# The second, which contains all quic/http3 usage, appears after "var transport http.RoundTripper".
+anchor = 'var transport http.RoundTripper'
+anchor_idx = content.find(anchor)
+if anchor_idx == -1:
+    print("ERROR: anchor not found"); exit(1)
+
 marker = 'if httpVersion == "3" {'
-idx = content.find(marker)
+# Search only after the anchor
+search_from = anchor_idx + len(anchor)
+idx = content.find(marker, search_from)
 if idx == -1:
-    print("WARNING: H3 marker not found")
-else:
-    # brace_start = position of the `{` that opens the H3 body
-    brace_start = idx + len(marker) - 1  # last char of marker is `{`
-    depth = 1
-    pos = brace_start + 1
-    while pos < len(content) and depth > 0:
-        if content[pos] == '{':
-            depth += 1
-        elif content[pos] == '}':
-            depth -= 1
-        pos += 1
-    # content[pos-1] is the matching `}` (closing H3 block)
-    # Replace everything between { and } (exclusive) with a stub comment
-    content = (content[:brace_start + 1] +
-               '\n\t\t// HTTP/3 (quic-go) removed from this build\n\t' +
-               content[pos - 1:])
+    print("ERROR: H3 marker not found after anchor"); exit(1)
+
+# brace_start = position of the `{` that opens the H3 body
+brace_start = idx + len(marker) - 1
+depth = 1
+pos = brace_start + 1
+while pos < len(content) and depth > 0:
+    if content[pos] == '{':
+        depth += 1
+    elif content[pos] == '}':
+        depth -= 1
+    pos += 1
+# content[pos-1] is the matching `}` — replace body between { and }
+content = (content[:brace_start + 1] +
+           '\n\t\t// HTTP/3 (quic-go) removed: not needed for VLESS+XHTTP+Reality\n\t' +
+           content[pos - 1:])
+
+print(f"H3 block stubbed OK (was at offset {idx})")
 
 with open(path, 'w') as f:
     f.write(content)
